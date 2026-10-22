@@ -15,7 +15,14 @@ void checked(cudaError_t e, const char* where) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(e));
 }
 #define CU(x) checked((x), #x)
-constexpr int W=96,H=64,SAMPLES=4,DEPTH=8,MAX_SPHERES=128,STACK=32;
+#ifndef PT_WIDTH
+#define PT_WIDTH 96
+#define PT_HEIGHT 64
+#define PT_SAMPLES 4
+#define PT_SCENE 0
+#endif
+constexpr int W=PT_WIDTH,H=PT_HEIGHT,SAMPLES=PT_SAMPLES,DEPTH=8,MAX_SPHERES=4096,STACK=32;
+static_assert(W>0 && H>0 && SAMPLES>0 && W*H*SAMPLES<=16000000, "bounded path capacity");
 struct Ray { vec3 o,d; };
 struct Sphere { vec3 c,albedo; float r; int material; };
 struct Node { vec3 lo,hi; int left,right,object; };
@@ -80,7 +87,7 @@ __global__ void megakernel(Scene s,vec3* colors,bool bvh,int* error,unsigned* co
     int id=blockIdx.x*blockDim.x+threadIdx.x;if(id>=W*H*SAMPLES)return;
     Path p=primary(id);colors[id]=vec3(0,0,0);
     for(int bounce=0;bounce<DEPTH;bounce++) {
-        atomicAdd(counts+bounce,1);Hit h=intersect(p.ray,s,bvh,error);
+        if(counts)atomicAdd(counts+bounce,1);Hit h=intersect(p.ray,s,bvh,error);
         if(h.object<0){colors[id]=p.throughput*sky(p.ray.d);return;}
         if(s.spheres[h.object].material==1)scatter<1>(p,h,s,bounce);else scatter<0>(p,h,s,bounce);
     }
@@ -131,22 +138,67 @@ void test_intersections(Scene scene,const std::vector<Sphere>& spheres,int* erro
     require(*error==0,"GPU intersection error");std::cout<<"intersection_tests="<<test.size()<<" GPU_BVH_naive_CPU=pass\n";
 }
 void image(const std::filesystem::path& file,const std::vector<vec3>& values){std::ofstream out(file);require(bool(out),"image output open failed");out<<"P3\n"<<W<<' '<<H<<"\n255\n";double energy=0;for(int y=H-1;y>=0;y--)for(int x=0;x<W;x++){vec3 c(0,0,0);for(int sample=0;sample<SAMPLES;sample++)c+=values[(y*W+x)*SAMPLES+sample];c/=float(SAMPLES);for(int k=0;k<3;k++){require(std::isfinite(c[k])&&c[k]>=0&&c[k]<=1.001f,"invalid radiance");energy+=c[k];out<<int(255.99f*sqrtf(std::min(1.f,c[k])))<<' ';}out<<'\n';}require(energy>100,"black render");require(bool(out),"image write failed");}
-int main(int argc,char** argv){try{
-    require(argc<=2,"usage: path-tracer [output-directory|--doctor]");cudaDeviceProp prop;CU(cudaGetDeviceProperties(&prop,0));std::cout<<"GPU="<<prop.name<<" compute="<<prop.major<<'.'<<prop.minor<<"\n";
-    if(argc==2&&std::string(argv[1])=="--doctor")return 0;
-    std::filesystem::path directory=argc==2?argv[1]:"evidence";std::filesystem::create_directories(directory);
+
+struct RenderBuffers {
+    int *error,*count,*seen,*material_indices,*material_sizes;
+    Path *a,*b; Hit* hits; vec3* colors; unsigned* counts;
+};
+struct RenderResult { int launches=0; std::array<unsigned,DEPTH> bounce_counts{}; };
+RenderResult renderBackend(Scene scene,RenderBuffers p,int mode,bool validate,bool waitAfterRaycast=true) {
+    RenderResult result;
+    if(mode<2){megakernel<<<(W*H*SAMPLES+127)/128,128>>>(scene,p.colors,mode==1,p.error,validate?p.counts:nullptr);result.launches++;synchronize();if(validate)std::copy(p.counts,p.counts+DEPTH,result.bounce_counts.begin());}
+    else {initialize<<<(W*H*SAMPLES+127)/128,128>>>(p.a,p.colors);result.launches++;synchronize();Path* in=p.a;Path* out=p.b;int n=W*H*SAMPLES;
+        for(int bounce=0;bounce<DEPTH;bounce++) {result.bounce_counts[bounce]=n;if(!n)break;*p.count=0;
+            raycast<<<(n+127)/128,128>>>(scene,in,p.hits,n,p.error);result.launches++;
+            // Candidate removes only this host wait. Later kernels consume hits on
+            // the same default stream; retain immediate launch-error checking.
+            if(waitAfterRaycast)synchronize();else CU(cudaGetLastError());
+            if(mode==2){shade<-1><<<(n+127)/128,128>>>(scene,in,p.hits,n,out,p.count,p.colors,bounce,p.error);result.launches++;}
+            else{CU(cudaMemset(p.material_sizes,0,2*sizeof(int)));group_materials<<<(n+127)/128,128>>>(scene,in,p.hits,n,p.material_indices,p.material_sizes,p.colors);result.launches++;synchronize();
+                require(p.material_sizes[0]+p.material_sizes[1]<=n,"material queue capacity");
+                int diffuse=p.material_sizes[0],metal=p.material_sizes[1];
+                if(diffuse){shade<0><<<(diffuse+127)/128,128>>>(scene,in,p.hits,diffuse,out,p.count,p.colors,bounce,p.error,p.material_indices);result.launches++;CU(cudaGetLastError());}
+                if(metal){shade<1><<<(metal+127)/128,128>>>(scene,in,p.hits,metal,out,p.count,p.colors,bounce,p.error,p.material_indices+W*H*SAMPLES);result.launches++;}}
+            synchronize();require(*p.count>=0&&*p.count<=n,"lost queue capacity invariant");n=*p.count;
+            if(validate){CU(cudaMemset(p.seen,0,W*H*SAMPLES*sizeof(int)));if(n){check_ids<<<(n+127)/128,128>>>(out,n,p.seen,p.error);result.launches++;synchronize();}}std::swap(in,out);
+        }
+    }
+    return result;
+}
+
+std::vector<Sphere> makeScene() {
     std::vector<Sphere> spheres={{{0,-1000,0},{.65f,.65f,.65f},1000,0},{{-1.5f,.7f,0},{.8f,.25f,.15f},.7f,0},{{0,.7f,0},{.8f,.85f,.9f},.7f,1},{{1.5f,.7f,0},{.2f,.6f,.3f},.7f,0}};
     for(int x=-4;x<=4;x++)for(int z=-5;z<=-2;z++)spheres.push_back({vec3(x*.65f,.2f,z*.65f),vec3(.3f+.04f*(x+4),.4f,.65f),.2f,(x+z)%2==0?1:0});
+    if constexpr(PT_SCENE>0) {
+        spheres.resize(4);const int side=PT_SCENE==1?20:40;
+        for(int x=0;x<side;x++)for(int z=0;z<side;z++) {
+            float step=12.f/side;
+            spheres.push_back({vec3((x-(side-1)*.5f)*step,.15f+random01(x*side+z,4,0)*.4f,-1.f-z*step),vec3(.2f+.6f*random01(x*side+z,4,1),.4f,.65f),step*.35f,(x+z)%2});
+        }
+    }
     require(spheres.size()<=MAX_SPHERES,"scene exceeds sphere capacity");
     for(auto s:spheres){require(s.r>0&&std::isfinite(s.r)&&s.material>=0&&s.material<2,"invalid scene");for(int k=0;k<3;k++)require(std::isfinite(s.c[k])&&std::abs(s.c[k])<=1000&&std::isfinite(s.albedo[k])&&s.albedo[k]>=0&&s.albedo[k]<=1,"invalid geometry or material");}
+    return spheres;
+}
+
+#ifndef PT_LIBRARY
+int main(int argc,char** argv){try{
+    const bool smoke=argc==3&&std::string(argv[2])=="--smoke";
+    require(argc<=2||smoke,"usage: path-tracer [output-directory|--doctor] [--smoke]");cudaDeviceProp prop;CU(cudaGetDeviceProperties(&prop,0));std::cout<<"GPU="<<prop.name<<" compute="<<prop.major<<'.'<<prop.minor<<"\n";
+    if(argc==2&&std::string(argv[1])=="--doctor")return 0;
+    std::filesystem::path directory=argc>=2?argv[1]:"evidence";std::filesystem::create_directories(directory);
+    std::vector<Sphere> spheres=makeScene();
+    std::cout<<"workload width="<<W<<" height="<<H<<" spp="<<SAMPLES<<" depth="<<DEPTH<<" scene="<<PT_SCENE<<" spheres="<<spheres.size()<<" seed=counter_keyed_fixed\n";
     std::vector<int> ids;for(int i=0;i<int(spheres.size());i++)ids.push_back(i);std::vector<Node> nodes;build(nodes,ids,spheres);
     Device<Sphere> ds(spheres.size());Device<Node> dn(nodes.size());std::copy(spheres.begin(),spheres.end(),ds.p);std::copy(nodes.begin(),nodes.end(),dn.p);Scene scene{ds.p,dn.p,int(spheres.size())};
     Device<int> error(1),count(1),seen(W*H*SAMPLES),material_indices(2*W*H*SAMPLES),material_sizes(2);*error.p=0;test_intersections(scene,spheres,error.p);
     Device<Path> a(W*H*SAMPLES),b(W*H*SAMPLES);Device<Hit> hits(W*H*SAMPLES);Device<vec3> colors(W*H*SAMPLES);Device<unsigned> counts(DEPTH);
+    const RenderBuffers buffers{error.p,count.p,seen.p,material_indices.p,material_sizes.p,a.p,b.p,hits.p,colors.p,counts.p};
+    std::cout<<"managed_allocation_bytes="<<(ds.n*sizeof(Sphere)+dn.n*sizeof(Node)+(seen.n+material_indices.n+material_sizes.n+error.n+count.n)*sizeof(int)+(a.n+b.n)*sizeof(Path)+hits.n*sizeof(Hit)+colors.n*sizeof(vec3)+counts.n*sizeof(unsigned))<<"\n";
     std::array<std::string,4> names={"naive-megakernel","bvh-megakernel","compact-wavefront","grouped-wavefront"};std::vector<vec3> reference;std::array<unsigned,DEPTH> reference_counts{};
     cudaEvent_t start,stop;CU(cudaEventCreate(&start));CU(cudaEventCreate(&stop));
     initialize<<<(W*H*SAMPLES+127)/128,128>>>(a.p,colors.p);synchronize();
-    for(int repeat=0;repeat<3;repeat++){
+    for(int repeat=0;repeat<(smoke?0:3);repeat++){
         CU(cudaEventRecord(start));
         raycast<<<(W*H*SAMPLES+127)/128,128>>>(scene,a.p,hits.p,W*H*SAMPLES,error.p);
         CU(cudaGetLastError());CU(cudaEventRecord(stop));CU(cudaEventSynchronize(stop));
@@ -155,28 +207,18 @@ int main(int argc,char** argv){try{
         require(hit_count>0&&*error.p==0,"raycast timing work missing");
         std::cout<<"raycast_kernel repeat="<<repeat<<" event_ms="<<ms<<" rays="<<W*H*SAMPLES<<" hits="<<hit_count<<"\n";
     }
-    for(int repeat=-1;repeat<5;repeat++)for(int mode=0;mode<4;mode++){
-        CU(cudaMemset(counts.p,0,DEPTH*sizeof(unsigned)));*error.p=0;int launches=0;std::array<unsigned,DEPTH> bounce_counts{};CU(cudaEventRecord(start));
-        if(mode<2){megakernel<<<(W*H*SAMPLES+127)/128,128>>>(scene,colors.p,mode==1,error.p,counts.p);launches++;synchronize();std::copy(counts.p,counts.p+DEPTH,bounce_counts.begin());}
-        else {initialize<<<(W*H*SAMPLES+127)/128,128>>>(a.p,colors.p);launches++;synchronize();Path* in=a.p;Path* out=b.p;int n=W*H*SAMPLES;
-            for(int bounce=0;bounce<DEPTH;bounce++) {bounce_counts[bounce]=n;if(!n)break;*count.p=0;
-                raycast<<<(n+127)/128,128>>>(scene,in,hits.p,n,error.p);launches++;synchronize();
-                if(mode==2){shade<-1><<<(n+127)/128,128>>>(scene,in,hits.p,n,out,count.p,colors.p,bounce,error.p);launches++;}
-                else{CU(cudaMemset(material_sizes.p,0,2*sizeof(int)));group_materials<<<(n+127)/128,128>>>(scene,in,hits.p,n,material_indices.p,material_sizes.p,colors.p);launches++;synchronize();
-                    require(material_sizes.p[0]+material_sizes.p[1]<=n,"material queue capacity");
-                    int diffuse=material_sizes.p[0],metal=material_sizes.p[1];
-                    if(diffuse){shade<0><<<(diffuse+127)/128,128>>>(scene,in,hits.p,diffuse,out,count.p,colors.p,bounce,error.p,material_indices.p);launches++;CU(cudaGetLastError());}
-                    if(metal){shade<1><<<(metal+127)/128,128>>>(scene,in,hits.p,metal,out,count.p,colors.p,bounce,error.p,material_indices.p+W*H*SAMPLES);launches++;}}
-                synchronize();require(*count.p>=0&&*count.p<=n,"lost queue capacity invariant");n=*count.p;
-                CU(cudaMemset(seen.p,0,W*H*SAMPLES*sizeof(int)));if(n){check_ids<<<(n+127)/128,128>>>(out,n,seen.p,error.p);launches++;synchronize();}std::swap(in,out);
-            }
-        }
-        CU(cudaEventRecord(stop));CU(cudaEventSynchronize(stop));float ms;CU(cudaEventElapsedTime(&ms,start,stop));require(*error.p==0,"GPU queue or traversal failure");
+    for(int repeat=-1;repeat<(smoke?0:5);repeat++)for(int mode=0;mode<4;mode++){
+        CU(cudaMemset(counts.p,0,DEPTH*sizeof(unsigned)));*error.p=0;
+        if(!smoke)CU(cudaEventRecord(start));
+        const auto rendered=renderBackend(scene,buffers,mode,true);
+        const int launches=rendered.launches;const auto& bounce_counts=rendered.bounce_counts;
+        float ms=0;if(!smoke){CU(cudaEventRecord(stop));CU(cudaEventSynchronize(stop));CU(cudaEventElapsedTime(&ms,start,stop));}require(*error.p==0,"GPU queue or traversal failure");
         std::vector<vec3> result(colors.p,colors.p+W*H*SAMPLES);
         if(reference.empty()){reference=result;reference_counts=bounce_counts;}
-        require(bounce_counts==reference_counts,"lost or extra paths at bounce");float max_error=0;for(size_t i=0;i<result.size();i++)for(int k=0;k<3;k++)max_error=std::max(max_error,std::abs(result[i][k]-reference[i][k]));require(max_error<1e-6f,"integrator parity mismatch");
+        require(bounce_counts==reference_counts,"lost or extra paths at bounce");float max_error=0;for(size_t i=0;i<result.size();i++)for(int k=0;k<3;k++){require(std::isfinite(result[i][k]),"non-finite linear radiance");max_error=std::max(max_error,std::abs(result[i][k]-reference[i][k]));}require(max_error<1e-6f,"integrator parity mismatch");
         if(repeat>=0){std::cout<<"repeat="<<repeat<<" backend="<<names[mode]<<" event_interval_ms="<<ms<<" kernel_launches="<<launches<<" max_error="<<max_error<<" rays=";for(auto c:bounce_counts)std::cout<<c<<',';std::cout<<"\n";}
-        if(repeat==0)image(directory/(names[mode]+".ppm"),result);
+        if(repeat==0||smoke)image(directory/(names[mode]+".ppm"),result);
     }
     CU(cudaEventDestroy(start));CU(cudaEventDestroy(stop));std::cout<<"PASS finite_lighting parity unique_ids bounded_queues cleanup\n";return 0;
 }catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}}
+#endif

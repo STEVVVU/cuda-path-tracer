@@ -15,6 +15,10 @@ Run `nvidia-smi` and `build/path-tracer.exe --doctor`. Both must succeed.
 Run `powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1`.
 This drives real GPU intersection checks and all render backends with identical seeds.
 
+For the frozen larger workload, follow the maintained [Google Benchmark fixture](../../../tools/benchmark/README.md): `tools/benchmark.ps1 Build`, `Smoke`, then `Measure`. Build and GPU phases require an exclusive resource slot. Smoke is a one-iteration framework dry run, not accepted performance evidence. The framework owns warmup, calibration, repetitions, interleaving, and JSON reporting.
+
+The reviewed raycast-wait A/B uses the same three commands with `-CompareRaycastSync`, separate raw receipts and `python tools/summarize-benchmark.py --compare-raycast-sync`. Preserve original nine-group evidence. Its 637 measured rows pass their oracles, but all 28 wall/event A/B ranges overlap; no production default switch or speedup is established. Curator controls run with `python tools/test_summarize_benchmark.py` without launching CUDA.
+
 ## Evidence
 The driver preserves transcripts and PPM renders under `evidence/`. Compare linear
 framebuffers before quantization, finite colors, path IDs and bounce counts.
