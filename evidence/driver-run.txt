@@ -1,0 +1,27 @@
+GPU=NVIDIA GeForce RTX 5080 Laptop GPU compute=12.0
+GPU=NVIDIA GeForce RTX 5080 Laptop GPU compute=12.0
+intersection_tests=4102 GPU_BVH_naive_CPU=pass
+raycast_kernel repeat=0 event_ms=0.268832 rays=24576 hits=14265
+raycast_kernel repeat=1 event_ms=0.347136 rays=24576 hits=14265
+raycast_kernel repeat=2 event_ms=0.378112 rays=24576 hits=14265
+repeat=0 backend=naive-megakernel event_interval_ms=0.561952 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=0 backend=bvh-megakernel event_interval_ms=0.710112 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=0 backend=compact-wavefront event_interval_ms=8.75072 kernel_launches=25 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=0 backend=grouped-wavefront event_interval_ms=12.8309 kernel_launches=41 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=1 backend=naive-megakernel event_interval_ms=0.614176 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=1 backend=bvh-megakernel event_interval_ms=0.697536 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=1 backend=compact-wavefront event_interval_ms=8.68042 kernel_launches=25 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=1 backend=grouped-wavefront event_interval_ms=13.322 kernel_launches=41 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=2 backend=naive-megakernel event_interval_ms=0.6008 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=2 backend=bvh-megakernel event_interval_ms=0.671168 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=2 backend=compact-wavefront event_interval_ms=8.86115 kernel_launches=25 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=2 backend=grouped-wavefront event_interval_ms=13.5506 kernel_launches=41 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=3 backend=naive-megakernel event_interval_ms=0.60256 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=3 backend=bvh-megakernel event_interval_ms=0.679264 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=3 backend=compact-wavefront event_interval_ms=8.91555 kernel_launches=25 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=3 backend=grouped-wavefront event_interval_ms=12.9569 kernel_launches=41 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=4 backend=naive-megakernel event_interval_ms=0.634048 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=4 backend=bvh-megakernel event_interval_ms=0.672704 kernel_launches=1 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=4 backend=compact-wavefront event_interval_ms=9.21827 kernel_launches=25 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+repeat=4 backend=grouped-wavefront event_interval_ms=13.9176 kernel_launches=41 max_error=0 rays=24576,14265,5718,2736,1634,1079,752,564,
+PASS finite_lighting parity unique_ids bounded_queues cleanup

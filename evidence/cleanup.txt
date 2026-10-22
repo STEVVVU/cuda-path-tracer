@@ -1,0 +1,1 @@
+PASS failure path returned nonzero; CLI processes exited; evidence retained

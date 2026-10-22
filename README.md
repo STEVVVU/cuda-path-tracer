@@ -1,81 +1,86 @@
-Ray Tracing in One Weekend in CUDA
-==================================
+# CUDA path tracer
 
-This is yet another _Ray Tracing in One Weekend_ clone, but this time using CUDA instead of C++.
+Bounded real-GPU path tracing with naive/BVH megakernels, stream-compacted wavefront
+queues, and per-material GPU index queues feeding specialized diffuse/metal kernels.
+The four modes run the same scene, integrator and counter-keyed samples.
 
-By Roger Allen
-May, 2018
+![Actual CUDA render](evidence/grouped-wavefront.png)
 
-See the [Master Branch](https://github.com/rogerallen/raytracinginoneweekend) for more information.
+## Run
 
-Chapter 1
----------
+Windows, VS 2022 C++ Build Tools, CUDA 13.0 and a Blackwell NVIDIA GPU are required;
+the local build targets `sm_120`. From the repository root:
 
-This introduces the basic kernel launch mechanism & host/device memory management.  We are just creating an image on the GPU device and cudaMallocmanaged allows for sharing the framebuffer and automatically copying that buffer to & from the device.
+```powershell
+cmd /c tools\build.cmd upstream
+cmd /c tools\build.cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify.ps1
+python tools/check-evidence.py
+```
 
-I also added a timer to see how long it takes the GPU to do rendering.
+`build/path-tracer.exe --doctor` reports the GPU. `build/path-tracer.exe evidence`
+renders four 96x64 PPM files, four samples/pixel, eight bounces. Invalid arguments
+return nonzero. The reusable lifecycle driver lives in
+`.agents/skills/verify-cuda-path-tracer/SKILL.md`. There are no persistent processes;
+cleanup preserves the evidence.
 
-Chapter 2
----------
+The isolated toolchain lives at `%USERPROFILE%/.codex/tools/coursework-cuda/toolkit`:
+overlay `cuda_nvcc`, `cuda_cudart`, `cuda_crt`, `cuda_cccl`, `libnvvm` and `libcurand`
+Windows x86-64 archives from NVIDIA's official
+[13.0.2 manifest](https://developer.download.nvidia.com/compute/cuda/redist/redistrib_13.0.2.json).
+Every archive was byte-count/SHA256 verified before extraction. Tools and NVIDIA
+licenses stay outside Git. There is no global PATH mutation, driver installation,
+unsupported-compiler bypass or watchdog change.
 
-Because CUDA is compatible with C++ and the vec3.h class will be used on both GPU & CPU, we add `__host__` `__device__` as a prefix to all methods.
+## Implementation and checks
 
-Chapter 3
----------
+`wavefront.cu` reuses upstream `vec3.h`. A host-built balanced median BVH is traversed
+on the GPU with a checked fixed stack. Materials are cosine-weighted Lambertian and
+perfect mirror. Camera jitter provides stochastic antialiasing. Stable path IDs and
+keyed `(path,bounce,dimension)` sampling make queue reordering reproducible. Atomic
+compaction reserves one full-capacity output slot per survivor. Grouping fills separate
+diffuse and metal index queues before specialized shader launches. The owned procedural
+scene contains 40 spheres; no external assets are required.
 
-Since the ray class is only used on the GPU, we will just add `__device__` as a prefix to all methods.
+The first default-contraction experiment failed cross-kernel integrator parity;
+`--fmad=false` gives the same explicit arithmetic policy across fused and split kernels.
+The resulting maximum linear color difference is zero. This reproducibility choice
+can affect performance.
 
-The color function just needs a `__device__` added since this is called from the render kernel.
+[GPU evidence](evidence/verification.txt): RTX 5080 Laptop GPU, compute 12.0, driver
+592.01, CUDA compiler 13.0.88, MSVC 14.44.35207. All 4,102 GPU BVH intersections agree
+with naive traversal and an independent double-precision CPU oracle, including inside,
+tangent, parallel and miss cases. All four renders have finite nonzero lighting,
+identical linear colors and identical PPM pixels. Per-bounce counts are
+`24576,14265,5718,2736,1634,1079,752,564`; kernels launched are 1/1/25/41 respectively.
+Queue IDs are checked for range and duplicates at every bounce; counts match baseline.
 
-Note, doing a straight translation from the original C++ will mean that any floating-point constants will be doubles and math on the GPU will be forced to be double-precision.  This will hurt our performance unnecessarily.  Special attention to floating point constants must be taken (e.g. 0.5 -> 0.5f).
+One warmup precedes five runs per mode. CUDA event intervals surround the backend,
+including synchronization, managed-memory transfers, host gaps and validation; these
+are **not isolated kernel timings**. The tiny wavefront workload is slower, and no
+speedup or production-scale conclusion is claimed. CI only checks retained historical
+GPU artifacts and upstream integrity on CPU; it does not execute CUDA.
+Three additional `raycast_kernel` timings bracket only the BVH raycast launch with
+CUDA events recorded immediately around it; nonzero resulting hits prove the work.
 
-Use the "profile_metrics" makefile target to count inst_fp_64 and be sure that is 0.
+## Sources and limits
 
-Chapter 4
----------
+Complete upstream history is retained from Roger Allen's
+[Ray Tracing in One Weekend in CUDA](https://github.com/rogerallen/raytracinginoneweekendincuda),
+branch `ch12_where_next_cuda`, SHA `ab140b12d4923b75270831baabab5e4d4209f305`.
+Original source is unchanged; [original README](README.upstream.md) retains attribution.
+The author explicitly dedicates the work to the public domain in the repository
+description, captured in [metadata](evidence/upstream-repository.json). GitHub reports
+no formal license file, so none is invented for upstream. The underlying Shirley book
+code uses [CC0](https://github.com/RayTracing/raytracing.github.io/blob/release/COPYING.txt),
+retained in [book-license.txt](evidence/book-license.txt). This is an educational 2018
+base, not a maintained production renderer. Existing camera, dielectric, metal and
+depth-of-field code is inherited; the new backend implements diffuse and mirror only.
 
-We only need to add a `__device__` to the hit_sphere() call and use profile_metrics to watch for those floating-point constants.
-
-Chapter 5
----------
-
-Here we have to create our world of spheres on the device and get familiar with how we do memory management for CUDA C++ classes.  Note the cudaMalloc of `d_list` and `d_world` and the `create_world` kernel.
-
-Again, attend to `__device__` and floating-point constants in hitable.h, hitable_list.h and sphere.h.
-
-Chapter 6
----------
-
-In this chapter we need to understand using cuRAND for per-thread random numbers.  See `d_rand_state` and `render_init`.
-
-Note that now using debug flags in compilation makes a big difference in runtime.  Remove those flags for a signficant speedup.
-
-Chapter 7
----------
-
-Matching the C++ code in the color function in main.cu would recurse enough into the color() calls that it was crashing the program by overrunning the stack, so we turn this function into a limited-depth loop instead.  Later code in the book limits to a max depth of 50, so we adapt this a few chapters early on the GPU.
-
-Chapter 8
----------
-
-Just more plumbing for per-thread local random state, mostly.
-
-Chapter 9
----------
-
-Similar to previous modifications.
-
-Chapter 10
-----------
-
-Similar to previous modifications.
-
-Chapter 11
-----------
-
-Similar to previous modifications.
-
-Chapter 12
-----------
-
-And we're done!
+The experiment is informed by the public
+[UPenn instructions](https://github.com/CIS5650-Fall-2025/Project3-CUDA-Path-Tracer/blob/main/INSTRUCTION.md)
+and [Laine/Karras/Aila 2013](https://research.nvidia.com/sites/default/files/pubs/2013-07_Megakernels-Considered-Harmful/laine2013hpg_paper.pdf).
+No university/student skeleton is copied. This is not a submission, grader result or
+claim of full assignment completion. No triangle/OBJ loader, emissive geometry, MIS,
+large-scene benchmark or production scheduler is included. Original `main.cu` builds
+unmodified, but its large default render was not run.

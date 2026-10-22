@@ -1,0 +1,13 @@
+name: CPU retained-evidence checks (no GPU execution)
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: python3 tools/check-evidence.py
