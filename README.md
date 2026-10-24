@@ -6,6 +6,125 @@ The four modes run the same scene, integrator and counter-keyed samples.
 
 ![Actual CUDA render](evidence/grouped-wavefront.png)
 
+## Contents
+
+- [Architecture and execution guide](#architecture-and-execution-guide)
+- [Run](#run)
+- [Implementation and checks](#implementation-and-checks)
+- [Sources and limits](#sources-and-limits)
+- [Verification skill](.agents/skills/verify-cuda-path-tracer/SKILL.md)
+
+## Architecture and execution guide
+
+The project adds CUDA megakernel and wavefront render paths to an inherited educational path tracer. It reuses the camera, sphere/material types, and vector math. The host builds a balanced [BVH](#bvh); CUDA kernels trace and shade paths using the same integrator and [counter-based samples](#counter-based-randomness). GPU profiling tools are unavailable, so launch timing does not identify the limiting hardware operation.
+
+```mermaid
+flowchart LR
+  A["CLI and host"] --> B["Scene and BVH"]
+  B --> C["CUDA path tracer"]
+  C --> D["Managed buffers and kernels"]
+  D --> E["PPM images and checks"]
+```
+
+The host creates the scene and owns dispatch and output files. Device kernels execute traversal and integration; the PPM writer and independent CPU checks run on the host.
+
+```mermaid
+flowchart TD
+  subgraph host["Host setup and checks"]
+    A["Build sphere scene"] --> B["Build median BVH"]
+  B --> C["Compare naive, BVH, and CPU intersections"]
+    C -->|"mismatch"| X["Fail before render"]
+  end
+  C -->|"pass"| D["Initialize stable path IDs and samples"]
+  subgraph device["CUDA render"]
+    D --> E["Select render backend"]
+  E --> F["Megakernel traces and shades"]
+  E --> G["Wavefront raycast and compact"]
+  G --> H["Optional material queues and specialized shade"]
+  F --> I["Check counts and linear colors"]
+  H --> I
+    I -->|"valid"| J["Write PPM"]
+  end
+    I -->|"invalid"| X
+```
+
+In wavefront mode each bounce traces current paths, compacts survivors, shades them, and checks queue capacity. The grouped mode adds [material queues](#material-queue) and incurs extra launches and synchronization. Render modes share keyed random samples, making pixel parity a meaningful check.
+
+| Subsystem | Responsibility and invariant | Source |
+| --- | --- | --- |
+| Scene and host setup | Creates bounded sphere scenes, builds the median BVH, and allocates managed buffers. | [`wavefront.cu`](wavefront.cu), [`main.cu`](main.cu) |
+| Traversal | Compares naive sphere traversal with fixed-stack BVH traversal and records hit state. | [`wavefront.cu`](wavefront.cu) |
+| Integrator | Keeps path IDs and counter-keyed samples stable across backend scheduling. | [`wavefront.cu`](wavefront.cu) |
+| Queue execution | Compacts surviving paths, bounds counts, and optionally groups material indices. | [`wavefront.cu`](wavefront.cu) |
+| Build and lifecycle verification | Builds, runs doctor/smoke, checks evidence, and preserves outputs. | [`build.cmd`](tools/build.cmd), [`verify.ps1`](tools/verify.ps1), [verification guide](.agents/skills/verify-cuda-path-tracer/SKILL.md) |
+
+The execution journey is:
+
+1. Run the documented build for the inherited executable and the CUDA extension. The driver checks the installed GPU before allocating the render scene.
+2. The host builds the sphere list and balanced median BVH, then tests GPU BVH intersections against both naive traversal and a CPU double-precision oracle.
+3. The selected mode traces paths for each bounce. Wavefront modes compact survivors into bounded buffers; grouped mode also assigns diffuse and metal path indices.
+4. The renderer checks queue bounds, unique IDs, finite radiance, and parity against the reference. A failed check exits before treating the image as valid; a passing run writes PPM files.
+
+| Choice | Current implementation and rationale | Alternative and cost or reconsideration point |
+| --- | --- | --- |
+| Median BVH | A host-built balanced tree gives deterministic construction and bounded GPU stack traversal. | SAH construction can reduce some node visits but costs more host build work and is not established by current workloads. |
+| Four render organizations | Naive/BVH megakernels and compact/grouped wavefront paths isolate scheduling choices while holding scene and integrator constant. | A single path is simpler but cannot expose the queue and dispatch costs measured here. |
+| Counter-keyed samples | `(path,bounce,dimension)` keys preserve samples when queues reorder. | Stateful RNGs are simpler, but queue order could alter samples and invalidate direct parity checks. |
+| Fixed-capacity queues | Each survivor reserves a slot and counts are checked against capacity. | Dynamic growth would require host coordination; current bounded workload fits preallocated storage. |
+| Explicit `--fmad=false` | The build applies the same arithmetic policy across fused and split kernels; default contraction failed parity. | Re-enabling contraction needs a new parity and performance review because it changes arithmetic results. |
+
+These rationales are inferred from current implementation and recorded experiments. The modes target a fixed educational scene and do not establish production-scale throughput. Event intervals include synchronization, managed-memory transfers, host gaps, and validation; profiling the actual limiter remains unavailable.
+
+<a id="bvh"></a>
+
+<details><summary>What is a BVH?</summary>
+
+A bounding volume hierarchy groups objects under enclosing boxes so a ray can skip groups that it cannot hit. This project builds a balanced median tree on the host and traverses it with a checked fixed stack on the GPU.
+
+</details>
+
+<a id="megakernel"></a>
+
+<details><summary>What is a megakernel?</summary>
+
+A megakernel performs most path-tracing work in one GPU kernel per render. Here the naive and BVH modes use one such kernel, with BVH changing only intersection search.
+
+</details>
+
+<a id="wavefront"></a>
+
+<details><summary>What is wavefront path tracing?</summary>
+
+Wavefront tracing splits work into kernels for stages such as raycast and shade, with queues between stages. Here compact mode processes survivor paths in a queue at each bounce; extra launches make it slower on the small measured scene.
+
+</details>
+
+<a id="path-compaction"></a>
+
+<details><summary>What is path compaction?</summary>
+
+Path compaction copies active items into a dense queue after inactive paths are removed. Here atomic reservations assign survivor slots, and the host checks the resulting count against full-capacity storage.
+
+</details>
+
+<a id="counter-based-randomness"></a>
+
+<details><summary>What is counter-based randomness?</summary>
+
+Counter-based randomness derives each sample from a key rather than mutable generator state. The key uses path, bounce, and dimension, so scheduling order does not change the samples.
+
+</details>
+
+<a id="material-queue"></a>
+
+<details><summary>What is a material queue?</summary>
+
+A material queue groups path indices by the shader behavior they need. Grouped mode separates diffuse and mirror paths before launching specialized shade kernels; those extra steps have measurable overhead in the included workloads.
+
+</details>
+
+<a id="run"></a>
+
 ## Run
 
 Windows, VS 2022 C++ Build Tools, CUDA 13.0 and a Blackwell NVIDIA GPU are required;
