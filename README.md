@@ -7,6 +7,7 @@ The four modes run the same scene, integrator and counter-keyed samples.
 ![Actual CUDA render](evidence/grouped-wavefront.png)
 
 ## Contents
+- [Implementation techniques](#implementation-techniques)
 
 - [Architecture and execution guide](#architecture-and-execution-guide)
 - [Run](#run)
@@ -16,7 +17,7 @@ The four modes run the same scene, integrator and counter-keyed samples.
 
 ## Architecture and execution guide
 
-The project adds CUDA megakernel and wavefront render paths to an inherited educational path tracer. It reuses the camera, sphere/material types, and vector math. The host builds a balanced [BVH](#bvh); CUDA kernels trace and shade paths using the same integrator and [counter-based samples](#counter-based-randomness). GPU profiling tools are unavailable, so launch timing does not identify the limiting hardware operation.
+The project adds CUDA megakernel and wavefront render paths to an inherited educational path tracer. The active `wavefront.cu` path defines its own camera, ray, sphere, and scattering logic and reuses inherited vector math from `vec3.h`. The host builds a balanced [BVH](#bvh); CUDA kernels trace and shade paths using the same integrator and [counter-based samples](#counter-based-randomness). GPU profiling tools are unavailable, so launch timing does not identify the limiting hardware operation.
 
 ```mermaid
 flowchart LR
@@ -52,7 +53,7 @@ In wavefront mode each bounce traces current paths, compacts survivors, shades t
 
 | Subsystem | Responsibility and invariant | Source |
 | --- | --- | --- |
-| Scene and host setup | Creates bounded sphere scenes, builds the median BVH, and allocates managed buffers. | [`wavefront.cu`](wavefront.cu), [`main.cu`](main.cu) |
+| Scene and host setup | Creates bounded sphere scenes, builds the median BVH, and allocates managed buffers. | [`wavefront.cu`](wavefront.cu); [`main.cu`](main.cu) is the separate retained renderer |
 | Traversal | Compares naive sphere traversal with fixed-stack BVH traversal and records hit state. | [`wavefront.cu`](wavefront.cu) |
 | Integrator | Keeps path IDs and counter-keyed samples stable across backend scheduling. | [`wavefront.cu`](wavefront.cu) |
 | Queue execution | Compacts surviving paths, bounds counts, and optionally groups material indices. | [`wavefront.cu`](wavefront.cu) |
@@ -150,6 +151,190 @@ Windows x86-64 archives from NVIDIA's official
 Every archive was byte-count/SHA256 verified before extraction. Tools and NVIDIA
 licenses stay outside Git. There is no global PATH mutation, driver installation,
 unsupported-compiler bypass or watchdog change.
+
+## Implementation techniques
+
+The index maps the active tracing paths to their methods and source files. Rationale is inferred from current code. It covers the four-backend comparison implemented in `wavefront.cu`.
+
+| Subsystem | Techniques | Code |
+| --- | --- | --- |
+| Intersections | median-built BVH and explicit stack traversal ([card](#technique-p17-bvh-traversal)); differential intersection oracle ([card](#technique-p17-intersection-oracle)) | [`wavefront.cu`](wavefront.cu) |
+| Sampling and integration | counter-keyed deterministic samples ([card](#technique-p17-counter-sampling)); throughput path integration and scattering ([card](#technique-p17-path-integrator)) | [`wavefront.cu`](wavefront.cu) |
+| Scheduling | megakernel tracing and staged backend comparison ([card](#technique-p17-backend-scheduling)); stream-compacted bounded wavefront queue ([card](#technique-p17-wavefront-compaction)) | [`wavefront.cu`](wavefront.cu) |
+| Material specialization | atomic per-material queues and templated shading ([card](#technique-p17-material-queues)) | [`wavefront.cu`](wavefront.cu) |
+| Memory and launch boundaries | [managed-memory synchronization](#technique-p17-managed-memory-boundaries) | [`wavefront.cu`](wavefront.cu) |
+| Numerical policy | [floating-point contraction control](#technique-p17-fmad-policy) | [`tools/build.cmd`](tools/build.cmd), [`wavefront.cu`](wavefront.cu) |
+| Output validation | [linear-image checks before PPM output](#technique-p17-output-validation) | [`wavefront.cu`](wavefront.cu) |
+
+<a id="technique-p17-bvh-traversal"></a>
+
+<details>
+<summary>Median BVH construction and stack traversal</summary>
+
+**Mechanism.** The host recursively partitions sphere bounds around the median along the widest axis and emits flat nodes. A ray tests node bounds, skips misses, and visits child nodes with an explicit fixed-size stack. Leaf nodes test their sphere. The naive path scans all spheres for comparison. The bounds test uses a three-axis slab interval and treats near-zero direction components as parallel. Traversal pushes both children without sorting them by near distance, then prunes against the closest sphere hit found so far.
+
+**Example.** `intersect(ray, scene, true, error)` chooses tree traversal; `false` selects the linear path.
+
+**Why here.** The same sphere scene can exercise both traversal paths with matching hit records.
+
+**Tradeoffs.** The stack has a checked depth limit. A deeper tree reports an error instead of overflowing the local traversal array. The fixed stack is guarded by the host builder's depth check and the device overflow flag.
+
+**Code and ownership.** [`wavefront.cu`](wavefront.cu#L54) `intersect` and #L118 `build`. Extension; sphere math reuses inherited vector types.
+
+</details>
+
+<a id="technique-p17-intersection-oracle"></a>
+
+<details>
+<summary>Differential intersection oracle</summary>
+
+**Mechanism.** `test_intersections` sends hand-picked boundary rays and 4,096 generated rays through GPU naive and BVH traversal. It requires matching object IDs and hit distances, then checks the BVH distance or miss against a separate double-precision CPU quadratic solver.
+
+**Example.** The test set includes a parallel ray, a ray from inside a sphere, and a distant miss before the generated cases.
+
+**Why here.** The renderer changes only the search structure between naive and BVH modes, so comparing both paths against an independent solver checks traversal without treating either GPU path as its own oracle.
+
+**Tradeoffs.** The CPU solver covers spheres and these generated rays. It does not validate other primitive types or replace image-level integrator checks.
+
+**Code and ownership.** [`wavefront.cu`](wavefront.cu#L130) `oracle`, #L132 `test_intersections`, and #L115 `intersection_tests`. Extension.
+
+</details>
+
+<a id="technique-p17-counter-sampling"></a>
+
+<details>
+<summary>Counter-keyed path sampling</summary>
+
+**Mechanism.** `random01` hashes the stable path id, bounce and dimension. Sampling therefore depends on a path's identity and sample coordinate rather than the order in which CUDA threads process the queue. Primary camera jitter and material scattering request separate dimensions. `Path.id` remains the original sample index as compaction changes queue positions. Camera jitter uses dimensions 0 and 1 at bounce -1; diffuse scattering uses dimensions 0 and 1 for each bounce.
+
+**Example.** `random01(id, -1, 0)` jitters a pixel's first camera coordinate; scatter uses `(path id, bounce, dimension)`.
+
+**Why here.** Megakernel and queue-based modes can use the same sample stream even as survivor positions compact.
+
+**Tradeoffs.** The integer hash yields deterministic pseudorandom values for these keys, not a general statistical quality claim. Reusing a dimension would correlate requests.
+
+**Code and ownership.** [`wavefront.cu`](wavefront.cu#L66) `random01`, #L67 `primary`, #L73 `scatter`. Extension.
+
+</details>
+
+<a id="technique-p17-path-integrator"></a>
+
+<details>
+<summary>Throughput path integration and material scattering</summary>
+
+**Mechanism.** `Path` carries a ray, accumulated throughput, and stable sample ID. A diffuse hit samples a cosine-weighted hemisphere in a tangent frame; a mirror hit reflects the incoming direction. Both multiply throughput by the sphere albedo. A miss writes throughput times the sky color, while reaching the bounce limit leaves the initially black sample unchanged.
+
+**Example.** `scatter<0>` builds a diffuse direction from `sqrt(random01(...))`; `scatter<1>` reflects the ray. `megakernel` applies either until a miss or the fixed depth.
+
+**Why here.** The same small integrator runs in fused and queued backends, allowing those paths to compare scheduling while retaining path state.
+
+**Tradeoffs.** The renderer has no Russian roulette, emissive hits, or multiple importance sampling. The fixed bounce limit can discard paths that remain alive at the last bounce.
+
+**Code and ownership.** [`wavefront.cu`](wavefront.cu#L30) `Path`, #L73 `scatter`, #L72 `sky`, and #L86 `megakernel`. Extension; vector operations reuse inherited `vec3.h`.
+
+</details>
+
+<a id="technique-p17-backend-scheduling"></a>
+
+<details>
+<summary>Fused megakernel and staged wavefront scheduling</summary>
+
+**Mechanism.** The naive and BVH megakernels assign one CUDA thread to each sample and run its bounce loop in one launch. Compact wavefront mode initializes paths once, then launches raycast and shade work per bounce over the current active queue. Grouped mode inserts material classification and specialized shade launches between those stages.
+
+**Example.** `renderBackend` selects modes 0 and 1 for the fused kernel, mode 2 for compact queues, and mode 3 for grouped queues.
+
+**Why here.** These modes keep the scene and integrator shared while making kernel boundaries and queue scheduling explicit for the coursework comparison.
+
+**Tradeoffs.** Staging adds launches, synchronization, and queue traffic. The fused path keeps per-path work together but does not expose per-stage queues. Existing measurements are workload-specific and do not establish a general winner.
+
+**Code and ownership.** [`wavefront.cu`](wavefront.cu#L86) `megakernel`, #L95 `initialize`, and #L147 `renderBackend`. Extension.
+
+</details>
+
+<a id="technique-p17-wavefront-compaction"></a>
+
+<details>
+<summary>Stream-compacted wavefront queues</summary>
+
+**Mechanism.** Each bounce raycasts the current path array, then a shading kernel drops terminated paths and atomically appends surviving paths to the next array. The host synchronizes, checks the output count against input capacity and swaps input/output buffers for the next bounce. The megakernel instead traces and shades a path through all bounces in one kernel.
+
+**Example.** `raycast` fills hits; `shade` reserves a survivor slot with an atomic increment.
+
+**Why here.** The project compares divergent all-in-one work with staged queues on the same integrator.
+
+**Tradeoffs.** Queue stages add launches, synchronization and memory traffic. Atomic append order is not stable, so identity and sample keys stay in each `Path`. Each survivor reserves an output slot with `atomicAdd`; the device flags a reservation beyond full input capacity, and the host checks the completed count before the next bounce. Optional validation checks every surviving ID for range and duplication. The diagnostic candidate can omit the host wait after raycast because same-stream kernels consume its hits, but waits before host reads of managed counts remain.
+
+**Code and ownership.** [`wavefront.cu`](wavefront.cu#L95) `initialize`, #L96 `raycast`, #L104 `shade`, and #L149 render dispatch. Extension.
+
+</details>
+
+<a id="technique-p17-material-queues"></a>
+
+<details>
+<summary>Material-index queues and specialized shading</summary>
+
+**Mechanism.** `group_materials` classifies hit paths and atomically appends their indices into diffuse or metal lists. Templated `shade<MATERIAL>` kernels process each list with compile-time material selection. The output queue still stores full surviving paths; material lists store indices into the current input paths.
+
+**Example.** The host launches `shade<0>` only when the diffuse list is nonempty, then does the same for `shade<1>`.
+
+**Why here.** Grouped mode makes material-specific control flow explicit while preserving the compact-wavefront result path.
+
+**Tradeoffs.** Classification, queue counters and extra launches add work. Each material index list is sized to full input capacity, and the combined count is checked. The two index arrays each have capacity for the full active input, while `material_sizes` holds per-material counts. The host synchronizes before reading those counts; empty material groups do not launch a shade kernel.
+
+**Code and ownership.** [`wavefront.cu`](wavefront.cu#L97) `group_materials`, #L104 `shade`, #L157 render dispatch. Extension.
+
+</details>
+
+<a id="technique-p17-managed-memory-boundaries"></a>
+
+<details>
+<summary>Managed-memory synchronization at host and kernel boundaries</summary>
+
+**Mechanism.** `Device<T>` allocates scene, path, hit, counter, and color buffers with `cudaMallocManaged`. The host and kernels share those pointers, but `renderBackend` synchronizes before the CPU resets or reads queue state and before CPU validation reads rendered colors. Kernel launches also check CUDA errors, and `synchronize` checks both launch state and device completion.
+
+**Example.** After shading, `renderBackend` calls `synchronize()` before reading `*p.count`; grouped mode synchronizes after `group_materials` before reading `material_sizes`.
+
+**Why here.** Managed allocation removes explicit copies from this bounded host/device workflow, while explicit completion points make CPU access and per-bounce decisions safe.
+
+**Tradeoffs.** Synchronization blocks the host and contributes to measured intervals. Managed-memory prefetch is unsupported on the tested Windows configuration, so the code does not claim residency or isolate migration cost.
+
+**Code and ownership.** [`wavefront.cu`](wavefront.cu#L32) `Device`, #L128 `synchronize`, and #L147 `renderBackend`. Extension.
+
+</details>
+
+<a id="technique-p17-fmad-policy"></a>
+
+<details>
+<summary>Floating-point contraction control for parity</summary>
+
+**Mechanism.** The extension build passes `--fmad=false` to nvcc, preventing fused multiply-add contraction in the CUDA translation unit. The README records that the default-contraction experiment failed parity between the fused and split kernels; the explicit policy yields equal linear colors in the retained check.
+
+**Example.** `tools/build.cmd` compiles `wavefront.cu` with `-O2 --fmad=false`; the separate upstream build of `main.cu` does not set that flag.
+
+**Why here.** The four backends are compared on matching arithmetic results before their timing and output checks are accepted.
+
+**Tradeoffs.** Disabling contraction can affect performance and does not guarantee bitwise equality across other compilers or devices. Changing the flag requires rerunning parity checks.
+
+**Code and ownership.** [`tools/build.cmd`](tools/build.cmd#L12) extension build; [`wavefront.cu`](wavefront.cu#L218) linear-image parity check. Extension.
+
+</details>
+
+<a id="technique-p17-output-validation"></a>
+
+<details>
+<summary>Linear-image validation before PPM encoding</summary>
+
+**Mechanism.** After each backend, the host compares bounce counts and every linear RGB component against the first backend's reference, rejects non-finite values, and requires maximum error below `1e-6`. `image` then checks each averaged color is finite and within range, requires nonzero total energy, gamma-encodes with a square root, and checks the output stream.
+
+**Example.** `renderBackend` results are copied from managed `colors` before parity checks; only after those checks does `image` write a P3 PPM file.
+
+**Why here.** Comparing linear values catches backend differences before the lossy display transform and quantization.
+
+**Tradeoffs.** The first backend is the render reference, so the independent intersection oracle remains important. The energy threshold is specific to this bounded scene and is not a general image-quality metric.
+
+**Code and ownership.** [`wavefront.cu`](wavefront.cu#L140) `image`; [`wavefront.cu`](wavefront.cu#L218) backend parity check. Extension.
+
+</details>
 
 ## Implementation and checks
 
