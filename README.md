@@ -17,6 +17,431 @@ The four modes run the same scene, integrator and counter-keyed samples.
 
 ## Architecture and execution guide
 
+<!-- execution-flow:start -->
+### Execution flow
+
+Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
+
+<a id="review-walkthrough"></a>
+
+#### Walk through one concrete example
+
+Render the fixed supported scene in grouped-wavefront mode with path-ID validation enabled.
+
+**Trace.** [Initialize staged path queues](#flow-step-staged-init) → [Intersect active paths](#flow-step-staged-raycast) → [Partition hits by material](#flow-step-group-materials) → [Shade diffuse and metal queues](#flow-step-grouped-shade) → [Validate and advance queue](#flow-step-queue-advance) → [Validate unique path IDs](#flow-step-queue-ids).
+
+**Result and boundary.** Active paths are grouped by material, shaded by their specialized queues, then survivors advance to the next bounce; validation checks survivor IDs and queue bounds, while backend parity is checked before image output.
+
+<details>
+<summary>Implementation decisions to explain</summary>
+
+**Why group hit paths by material before shading?** Specialized diffuse and metal kernels can process matching paths without per-path material dispatch; grouping and queue maintenance add synchronization and indexing work.
+
+[Material-index queues and specialized shading](#technique-p17-material-queues).
+
+**Why validate that survivor IDs are unique after queue advancement?** A duplicate or out-of-range survivor can corrupt later path processing, so the optional check catches queue construction errors at the boundary; it adds validation work.
+
+[Stream-compacted wavefront queues](#technique-p17-wavefront-compaction).
+
+</details>
+
+#### Primary execution flow
+
+Active wavefront.cu CLI constructs a validated scene and BVH, checks intersection behavior, then runs each selected backend and compares results before image output. The four modes are loop-selected in main; fused and staged internals are detailed below.
+
+```mermaid
+flowchart TD
+  n1["1. Validate invocation and<br/>select device"]
+  click n1 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-cli-gpu" "Open step, techniques, and source" _top
+  n2["2. Build and validate workload<br/>scene"]
+  click n2 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-workload-scene" "Open step, techniques, and source" _top
+  n3["3. Build median-split BVH"]
+  click n3 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-bvh" "Open step, techniques, and source" _top
+  n4["4. Allocate managed buffers"]
+  click n4 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-managed-setup" "Open step, techniques, and source" _top
+  n5["5. Check BVH against brute force<br/>and CPU oracle"]
+  click n5 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-intersection-oracle" "Open step, techniques, and source" _top
+  n6["6. Select one of four renderer<br/>backends"]
+  click n6 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-backend-choice" "Open step, techniques, and source" _top
+  n16["16. Compare backends and bounce<br/>counts"]
+  click n16 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-parity" "Open step, techniques, and source" _top
+  n17["17. Validate and encode PPM<br/>image"]
+  click n17 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-write-image" "Open step, techniques, and source" _top
+  n19["19. Report failure and return<br/>nonzero"]
+  click n19 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-failure" "Open step, techniques, and source" _top
+  n1 -->|"not --doctor"| n2
+  n2 -->|"validated spheres"| n3
+  n3 -->|"nodes and spheres"| n4
+  n4 -->|"scene and error buffer"| n5
+  n5 -->|"oracle checks pass"| n6
+  n6 -->|"each mode returns RenderResult"| n16
+  n16 -->|"repeat is zero or smoke mode"| n17
+  n1 -.->|"invalid args, CUDA error, or thrown<br/>validation"| n19
+  n5 -.->|"oracle mismatch or traversal error"| n19
+  n16 -.->|"backend mismatch or nonfinite output"| n19
+  n17 -.->|"invalid radiance or I/O failure"| n19
+```
+
+**Detailed workflows.** [Scene, BVH, and intersection validation](#flow-workflow-scene-and-intersection-validation) · [Naive and BVH megakernel modes](#flow-workflow-fused-backends) · [Compact wavefront mode](#flow-workflow-compact-wavefront) · [Material-grouped wavefront mode](#flow-workflow-grouped-wavefront) · [Build policy and validated output](#flow-workflow-build-and-output-policy).
+
+<a id="flow-workflow-scene-and-intersection-validation"></a>
+
+<details>
+<summary>Scene, BVH, and intersection validation</summary>
+
+main builds the active scene/BVH, transfers both to managed buffers, and verifies GPU naive and BVH intersections against a double-precision CPU oracle before rendering.
+
+```mermaid
+flowchart TD
+  n2["2. Build and validate workload<br/>scene"]
+  click n2 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-workload-scene" "Open step, techniques, and source" _top
+  n3["3. Build median-split BVH"]
+  click n3 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-bvh" "Open step, techniques, and source" _top
+  n4["4. Allocate managed buffers"]
+  click n4 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-managed-setup" "Open step, techniques, and source" _top
+  n5["5. Check BVH against brute force<br/>and CPU oracle"]
+  click n5 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-intersection-oracle" "Open step, techniques, and source" _top
+  n19["19. Report failure and return<br/>nonzero"]
+  click n19 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-failure" "Open step, techniques, and source" _top
+  n2 -->|"validated spheres"| n3
+  n3 -->|"nodes and spheres"| n4
+  n4 -->|"scene and error buffer"| n5
+  n5 -.->|"assertion fails"| n19
+```
+
+</details>
+
+<a id="flow-workflow-fused-backends"></a>
+
+<details>
+<summary>Naive and BVH megakernel modes</summary>
+
+Modes 0 and 1 execute a fused per-sample integration kernel. Mode 0 scans spheres and mode 1 traverses the BVH; each updates bounce counters only when validation is enabled.
+
+```mermaid
+flowchart TD
+  n6["6. Select one of four renderer<br/>backends"]
+  click n6 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-backend-choice" "Open step, techniques, and source" _top
+  n7["7. Generate counter-keyed<br/>primary paths"]
+  click n7 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-primary" "Open step, techniques, and source" _top
+  n8["8. Trace and integrate in one<br/>kernel"]
+  click n8 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-fused-integrate" "Open step, techniques, and source" _top
+  n19["19. Report failure and return<br/>nonzero"]
+  click n19 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-failure" "Open step, techniques, and source" _top
+  n6 -->|"mode 0 or 1"| n7
+  n7 -->|"sample path"| n8
+  n8 -.->|"BVH stack overflow sets error"| n19
+```
+
+</details>
+
+<a id="flow-workflow-compact-wavefront"></a>
+
+<details>
+<summary>Compact wavefront mode</summary>
+
+Mode 2 initializes a full path array, raycasts active paths, shades all materials into a compact survivor queue, checks bounds/IDs, then swaps buffers until depth or an empty queue.
+
+```mermaid
+flowchart TD
+  n9["9. Initialize staged path queues"]
+  click n9 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-staged-init" "Open step, techniques, and source" _top
+  n7["7. Generate counter-keyed<br/>primary paths"]
+  click n7 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-primary" "Open step, techniques, and source" _top
+  n10["10. Intersect active paths"]
+  click n10 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-staged-raycast" "Open step, techniques, and source" _top
+  n11["11. Scatter survivors into<br/>compact queue"]
+  click n11 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-compact-shade" "Open step, techniques, and source" _top
+  n14["14. Validate and advance queue"]
+  click n14 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-queue-advance" "Open step, techniques, and source" _top
+  n15["15. Validate unique path IDs"]
+  click n15 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-queue-ids" "Open step, techniques, and source" _top
+  n19["19. Report failure and return<br/>nonzero"]
+  click n19 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-failure" "Open step, techniques, and source" _top
+  n9 -->|"one path per sample"| n7
+  n9 -->|"active paths"| n10
+  n10 -->|"hits ready"| n11
+  n11 -->|"survivor counter and output paths"| n14
+  n14 -->|"validate enabled and n positive"| n15
+  n14 -->|"next bounce while n&gt;0 and below depth"| n10
+  n11 -.->|"survivor capacity exceeded"| n19
+  n14 -.->|"queue invariant fails"| n19
+  n15 -.->|"ID invalid or duplicated"| n19
+```
+
+</details>
+
+<a id="flow-workflow-grouped-wavefront"></a>
+
+<details>
+<summary>Material-grouped wavefront mode</summary>
+
+Mode 3 groups hit indices into diffuse and metal queues, synchronizes to read their sizes, launches only nonempty specialized shading queues, then advances and validates the compact survivor array.
+
+```mermaid
+flowchart TD
+  n9["9. Initialize staged path queues"]
+  click n9 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-staged-init" "Open step, techniques, and source" _top
+  n10["10. Intersect active paths"]
+  click n10 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-staged-raycast" "Open step, techniques, and source" _top
+  n12["12. Partition hits by material"]
+  click n12 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-group-materials" "Open step, techniques, and source" _top
+  n13["13. Shade diffuse and metal<br/>queues"]
+  click n13 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-grouped-shade" "Open step, techniques, and source" _top
+  n14["14. Validate and advance queue"]
+  click n14 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-queue-advance" "Open step, techniques, and source" _top
+  n15["15. Validate unique path IDs"]
+  click n15 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-queue-ids" "Open step, techniques, and source" _top
+  n19["19. Report failure and return<br/>nonzero"]
+  click n19 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-failure" "Open step, techniques, and source" _top
+  n9 -->|"full active sample queue"| n10
+  n10 -->|"ray hits ready"| n12
+  n12 -->|"queue sizes and material indices"| n13
+  n13 -->|"material survivors"| n14
+  n14 -->|"validate enabled and n positive"| n15
+  n14 -->|"next bounce while n&gt;0 and below depth"| n10
+  n12 -.->|"material queue total exceeds n"| n19
+  n13 -.->|"survivor capacity exceeded"| n19
+  n15 -.->|"ID invalid or duplicated"| n19
+```
+
+</details>
+
+<a id="flow-workflow-build-and-output-policy"></a>
+
+<details>
+<summary>Build policy and validated output</summary>
+
+Independent build-time floating-point policy. tools/build.cmd creates the executable with --fmad=false; it does not invoke parity or rendering.
+
+```mermaid
+flowchart TD
+  n18["18. Compile active renderer with<br/>contraction disabled"]
+  click n18 href "https://github.com/STEVVVU/cuda-path-tracer#flow-step-fmad-build" "Open step, techniques, and source" _top
+```
+
+</details>
+
+#### Steps, techniques, and source
+
+These source traces cover the active scope below. They explain implementation behavior; benchmark results and their limits remain in the measurement sections.
+
+<a id="flow-step-cli-gpu"></a>
+
+##### 1. Validate invocation and select device
+
+**Component.** main. Accepts an output directory or --doctor, or an output directory paired with --smoke, queries device 0, and exits early only for the sole --doctor argument. Exceptions are printed as FAIL and return status 1.
+
+CLI admission and device query are basic entry behavior.
+
+**Source.** [`wavefront.cu:185`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L185). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-workload-scene"></a>
+
+##### 2. Build and validate workload scene
+
+**Component.** makeScene. Creates the fixed base spheres and optional PT_SCENE grid, then rejects excessive sphere count, nonpositive/nonfinite radii, invalid material IDs, or invalid geometry/albedo values.
+
+Scene construction is basic workload setup; the traversal structure is covered separately.
+
+**Source.** [`wavefront.cu:157`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L157). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-bvh"></a>
+
+##### 3. Build median-split BVH
+
+**Component.** build. Bounds each node, selects the longest extent, sorts sphere centers on that axis, and recursively splits at the median. Throws before exceeding the fixed traversal-stack depth.
+
+**Techniques at this step.** [Median BVH construction and stack traversal](#technique-p17-bvh-traversal).
+
+**Source.** [`wavefront.cu:118`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L118). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-managed-setup"></a>
+
+##### 4. Allocate managed buffers
+
+**Component.** Device and main. Allocates scene, BVH, path ping-pong, hit, color, queue, counter, and error buffers with cudaMallocManaged; copies host scene data and initializes the shared error flag.
+
+**Techniques at this step.** [Managed-memory synchronization at host and kernel boundaries](#technique-p17-managed-memory-boundaries).
+
+**Source.** [`wavefront.cu:32`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L32) · [`wavefront.cu:185`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L185). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-intersection-oracle"></a>
+
+##### 5. Check BVH against brute force and CPU oracle
+
+**Component.** test_intersections. Runs fixed and counter-generated rays through GPU naive and BVH intersection kernels, then compares object and distance results and checks a separate double-precision CPU quadratic oracle. Any mismatch or GPU traversal error throws.
+
+**Techniques at this step.** [Differential intersection oracle](#technique-p17-intersection-oracle) · [Median BVH construction and stack traversal](#technique-p17-bvh-traversal).
+
+**Source.** [`wavefront.cu:132`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L132) · [`wavefront.cu:115`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L115) · [`wavefront.cu:131`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L131). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-backend-choice"></a>
+
+##### 6. Select one of four renderer backends
+
+**Component.** main/renderBackend. The loop calls renderBackend for naive-megakernel, bvh-megakernel, compact-wavefront, and grouped-wavefront. Modes 0-1 use the fused kernel; modes 2-3 use staged kernels, with BVH traversal used by staged raycasts.
+
+**Techniques at this step.** [Fused megakernel and staged wavefront scheduling](#technique-p17-backend-scheduling).
+
+**Source.** [`wavefront.cu:185`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L185) · [`wavefront.cu:147`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L147). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-primary"></a>
+
+##### 7. Generate counter-keyed primary paths
+
+**Component.** primary/random01. Maps each sample ID to a pixel and derives subpixel offsets from integer-mixed (ID, bounce, dimension) keys, yielding the same path inputs independent of scheduling order.
+
+**Techniques at this step.** [Counter-keyed path sampling](#technique-p17-counter-sampling).
+
+**Source.** [`wavefront.cu:66`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L66) · [`wavefront.cu:67`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L67). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-fused-integrate"></a>
+
+##### 8. Trace and integrate in one kernel
+
+**Component.** megakernel. One thread initializes its color and iterates up to DEPTH, intersecting via the selected naive/BVH route. A miss stores throughput-weighted sky and exits; a hit dispatches material scattering and updates throughput.
+
+**Techniques at this step.** [Fused megakernel and staged wavefront scheduling](#technique-p17-backend-scheduling) · [Throughput path integration and material scattering](#technique-p17-path-integrator) · [Median BVH construction and stack traversal](#technique-p17-bvh-traversal).
+
+**Source.** [`wavefront.cu:86`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L86) · [`wavefront.cu:73`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L73) · [`wavefront.cu:72`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L72). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-staged-init"></a>
+
+##### 9. Initialize staged path queues
+
+**Component.** initialize. Writes one counter-keyed primary Path and zero color per sample into the first path buffer; host starts the staged loop with n equal to the full sample count.
+
+**Techniques at this step.** [Fused megakernel and staged wavefront scheduling](#technique-p17-backend-scheduling) · [Counter-keyed path sampling](#technique-p17-counter-sampling).
+
+**Source.** [`wavefront.cu:95`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L95) · [`wavefront.cu:147`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L147). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-staged-raycast"></a>
+
+##### 10. Intersect active paths
+
+**Component.** raycast/intersect. Each active path writes a Hit using BVH traversal. The host checks launch errors, and by default synchronizes before consuming hit data; the optional no-wait path retains same-stream ordering and immediate launch-error checking.
+
+**Techniques at this step.** [Median BVH construction and stack traversal](#technique-p17-bvh-traversal) · [Managed-memory synchronization at host and kernel boundaries](#technique-p17-managed-memory-boundaries) · [Stream-compacted wavefront queues](#technique-p17-wavefront-compaction).
+
+**Source.** [`wavefront.cu:96`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L96) · [`wavefront.cu:147`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L147) · [`wavefront.cu:128`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L128). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-compact-shade"></a>
+
+##### 11. Scatter survivors into compact queue
+
+**Component.** shade<MATERIAL>. For compact-wavefront, handles every active path, writes sky for misses, scatters hits, and atomically reserves one output slot per surviving path. A reservation beyond full sample capacity sets error 2; otherwise the path is written to the output buffer.
+
+**Techniques at this step.** [Stream-compacted wavefront queues](#technique-p17-wavefront-compaction) · [Throughput path integration and material scattering](#technique-p17-path-integrator).
+
+**Source.** [`wavefront.cu:104`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L104). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-group-materials"></a>
+
+##### 12. Partition hits by material
+
+**Component.** group_materials. Writes sky for miss paths and atomically appends hit indices to per-material queues. Host clears the two queue sizes, synchronizes after grouping, and rejects a combined queue size greater than the active input count.
+
+**Techniques at this step.** [Material-index queues and specialized shading](#technique-p17-material-queues) · [Stream-compacted wavefront queues](#technique-p17-wavefront-compaction).
+
+**Source.** [`wavefront.cu:97`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L97) · [`wavefront.cu:147`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L147). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-grouped-shade"></a>
+
+##### 13. Shade diffuse and metal queues
+
+**Component.** shade<0>/shade<1>. Launches diffuse and metal specializations only for nonempty queues, passing each queue's index slice. Each specialization scatters matching material paths into the shared survivor output queue; mismatched material checks return without writing.
+
+**Techniques at this step.** [Material-index queues and specialized shading](#technique-p17-material-queues) · [Throughput path integration and material scattering](#technique-p17-path-integrator) · [Stream-compacted wavefront queues](#technique-p17-wavefront-compaction).
+
+**Source.** [`wavefront.cu:104`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L104) · [`wavefront.cu:147`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L147). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-queue-advance"></a>
+
+##### 14. Validate and advance queue
+
+**Component.** renderBackend. Synchronizes after shading, checks 0 <= survivor count <= prior active count, records the next bounce count, and swaps input/output buffers. The loop stops when DEPTH is reached or n becomes zero.
+
+**Techniques at this step.** [Stream-compacted wavefront queues](#technique-p17-wavefront-compaction) · [Managed-memory synchronization at host and kernel boundaries](#technique-p17-managed-memory-boundaries) · [Fused megakernel and staged wavefront scheduling](#technique-p17-backend-scheduling).
+
+**Source.** [`wavefront.cu:147`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L147). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-queue-ids"></a>
+
+##### 15. Validate unique path IDs
+
+**Component.** check_ids. When validation is enabled, clears the seen array and checks every survivor ID is in range and appears once; violations set error codes 3 or 4.
+
+**Techniques at this step.** [Stream-compacted wavefront queues](#technique-p17-wavefront-compaction).
+
+**Source.** [`wavefront.cu:114`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L114) · [`wavefront.cu:147`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L147). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-parity"></a>
+
+##### 16. Compare backends and bounce counts
+
+**Component.** main. The first backend result becomes the reference. Each backend must match its bounce counts and finite linear radiance within 1e-6 per channel; traversal/queue errors or mismatch throw before output publication.
+
+**Techniques at this step.** [Linear-image validation before PPM encoding](#technique-p17-output-validation) · [Fused megakernel and staged wavefront scheduling](#technique-p17-backend-scheduling).
+
+**Source.** [`wavefront.cu:185`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L185). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-write-image"></a>
+
+##### 17. Validate and encode PPM image
+
+**Component.** image. Averages samples per pixel, rejects nonfinite, negative, or above-1.001 radiance, applies square-root encoding and writes P3 output. Rejects near-black aggregate energy and failed open/write operations.
+
+**Techniques at this step.** [Linear-image validation before PPM encoding](#technique-p17-output-validation).
+
+**Source.** [`wavefront.cu:140`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L140). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-fmad-build"></a>
+
+##### 18. Compile active renderer with contraction disabled
+
+**Component.** tools/build.cmd. The default build target invokes nvcc on wavefront.cu with --fmad=false, the active renderer's floating-point contraction policy. The separate upstream target builds main.cu without that option.
+
+**Techniques at this step.** [Floating-point contraction control for parity](#technique-p17-fmad-policy).
+
+**Source.** [`tools/build.cmd:12`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/tools/build.cmd#L12). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-failure"></a>
+
+##### 19. Report failure and return nonzero
+
+**Component.** main catch. Any thrown validation, capacity, filesystem, or CUDA runtime error is printed with FAIL and returns 1; normal completion destroys CUDA events and returns 0.
+
+This is basic CLI error reporting rather than a distinct ledger technique.
+
+**Source.** [`wavefront.cu:185`](https://github.com/STEVVVU/cuda-path-tracer/blob/main/wavefront.cu#L185). [Back to execution flow](#execution-flow).
+
+<details>
+<summary>Scope and subsystem coverage</summary>
+
+Active wavefront.cu renderer CLI, workload/configuration, scene and median BVH construction, counter-keyed primary paths, four backend modes, scattering and compaction/material queues, managed memory and launch boundaries, parity oracles, and validated image output. The upstream main.cu executable is an independent build target.
+
+- **Intersections.** Covers median BVH build, slab and sphere tests, naive/BVH differential tests, and independent CPU quadratic comparison. [Step 3](#flow-step-bvh), [Step 5](#flow-step-intersection-oracle), [Step 8](#flow-step-fused-integrate), [Step 10](#flow-step-staged-raycast).
+- **Path generation and integration.** Counter-keyed sample generation feeds both fused and staged execution; material scattering updates throughput and misses store sky radiance. [Step 7](#flow-step-primary), [Step 8](#flow-step-fused-integrate), [Step 9](#flow-step-staged-init), [Step 11](#flow-step-compact-shade), [Step 13](#flow-step-grouped-shade).
+- **Backend scheduling.** Documents mode dispatch, fused loop, staged kernel sequence, active counts, buffer swaps, and termination. [Step 6](#flow-step-backend-choice), [Step 8](#flow-step-fused-integrate), [Step 9](#flow-step-staged-init), [Step 10](#flow-step-staged-raycast), [Step 14](#flow-step-queue-advance).
+- **Material specialization.** Material IDs select queues and conditional specialized diffuse/metal launches. [Step 12](#flow-step-group-materials), [Step 13](#flow-step-grouped-shade).
+- **Memory and launch boundaries.** Managed allocation and host/device copies are identified with explicit synchronization and same-stream no-wait behavior. [Step 4](#flow-step-managed-setup), [Step 10](#flow-step-staged-raycast), [Step 12](#flow-step-group-materials), [Step 14](#flow-step-queue-advance).
+- **Numerical policy.** Default active nvcc target disables contraction; runtime compares resulting backend radiance within the coded tolerance. [Step 18](#flow-step-fmad-build), [Step 16](#flow-step-parity).
+- **Output validation.** Checks finite backend outputs and cross-mode parity before image encoding, then validates per-channel range, aggregate energy, and stream state. [Step 16](#flow-step-parity), [Step 17](#flow-step-write-image).
+
+Outside this flow audit:
+
+- `main.cu`. Separate inherited tutorial executable selected only by tools/build.cmd upstream target; no handoff into active wavefront renderer.
+- `hitable_list.h`. Used by inherited main.cu, not included by active wavefront.cu.
+- `tools/benchmark/`. Benchmark orchestration and fixtures drive workloads but do not implement the rendering path described here.
+
+</details>
+
+<!-- execution-flow:end -->
+
+<details>
+<summary>Subsystem technique index</summary>
+
 ### Subsystem map
 
 Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
@@ -49,6 +474,8 @@ flowchart LR
 7. [Output validation](#subsystem-output-validation)
 
 The project adds CUDA megakernel and wavefront render paths to an inherited educational path tracer. The active `wavefront.cu` path defines its own camera, ray, sphere, and scattering logic and reuses inherited vector math from `vec3.h`. The host builds a balanced [BVH](#bvh); CUDA kernels trace and shade paths using the same integrator and [counter-based samples](#counter-based-randomness). GPU profiling tools are unavailable, so launch timing does not identify the limiting hardware operation.
+
+</details>
 
 <details>
 <summary>Expand flow diagram 1</summary>
